@@ -692,7 +692,7 @@ jobs:
             # Real elapsed time: each loop also runs git_pull.sh, so counting 15s per pass undercounts.
             WAITED=$(( $(date +%s) - STANDBY_START_EPOCH ))
             if [ $((WAITED - LAST_HB_AT)) -ge 60 ]; then LAST_HB_AT=$WAITED; _standby_hb; _sdiag standby_wait_loop info "still waiting for go-file, waited=${WAITED}s"; fi
-            if [ $((WAITED - LAST_PULL_AT)) -ge 60 ]; then LAST_PULL_AT=$WAITED; bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh > /dev/null 2>&1 || true; fi
+            if [ $((WAITED - LAST_PULL_AT)) -ge 60 ]; then LAST_PULL_AT=$WAITED; bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh --no-copy-back > /dev/null 2>&1 || true; fi
 
             if [ "$SPAWN_FROZEN_DONE" -eq 0 ]; then
               SPAWN_FROZEN_DONE=1
