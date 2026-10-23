@@ -145,6 +145,20 @@ name: VPS-Shim Runner
 
 on:
   workflow_dispatch:
+    inputs:
+      role:
+        description: session or standby
+        required: false
+        default: session
+        type: string
+      cycle_id:
+        required: false
+        default: ''
+        type: string
+      from_run_id:
+        required: false
+        default: ''
+        type: string
   repository_dispatch:
     types: [restart-shim-runner, dispatch-standby-shim-runner]
 
@@ -155,7 +169,9 @@ env:
   # manual workflow_dispatch of `session` is ever used without a
   # standby cycle already primed (e.g. very first cold start).
   DOWNTIME_GAP_SECONDS: 600
-  STANDBY_DISPATCH_LEAD_SECONDS: 1200
+  STANDBY_DISPATCH_LEAD_SECONDS: 3000
+  STANDBY_WAIT_CEILING_SECONDS: 18000
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
   # v113 fix: repository_dispatch only triggers workflows defined in
   # the repo the event is POSTed to -- NOT wherever Actions minutes
   # happen to be unlimited. runner.yml (the thing that has to receive
@@ -172,12 +188,12 @@ env:
 
 jobs:
   session:
-    if: github.event_name == 'workflow_dispatch' || github.event.action == 'restart-shim-runner'
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.role != 'standby') || github.event.action == 'restart-shim-runner'
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id }}
-      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id }}
+      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id || github.event.inputs.cycle_id }}
+      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id || github.event.inputs.from_run_id }}
       DISPATCH_REASON: ${{ github.event.client_payload.reason }}
       EVENT_ACTION: ${{ github.event.action }}
       SESSION_ROLE: fresh-boot
@@ -410,6 +426,8 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
+          CAPD=90; CAPS=240; PUSHT=""
+          if [ "${{ job.status }}" = "cancelled" ]; then CAPD=15; CAPS=60; PUSHT="timeout 40"; fi
           if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
           # v221: guarded existence check -- a run that never got past
           # an early step (e.g. cancelled during Free disk space, before
@@ -422,13 +440,13 @@ jobs:
           # end behavior (never blocks job completion), just an honest
           # log line instead of a misleading one.
           if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
-            timeout 90 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.start.outputs.start_epoch }}" >/dev/null 2>&1 || true
+            timeout $CAPD python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.start.outputs.start_epoch }}" >/dev/null 2>&1 || true
           fi
           if [ -f /home/runner/shim/repo/vps-shim/scripts/store_sync.py ]; then
-            SHIM_ROOT=/home/runner/shim timeout 240 python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
+            SHIM_ROOT=/home/runner/shim timeout $CAPS python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
           fi
           if [ -f /home/runner/shim/repo/vps-shim/scripts/git_push.sh ]; then
-            bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+            $PUSHT bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
           else
             echo "repo was never checked out this run (likely cancelled before Setup environment) -- nothing to push, skipping"
           fi
@@ -442,68 +460,86 @@ jobs:
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
           if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
-          # v222 (watchdog removed entirely -- self-respawn replaces it):
-          # this step is the whole mechanism. `if: always()` steps are
-          # explicitly granted a real grace window during cancellation --
-          # documented GitHub behavior, not a trick: on cancel, the
-          # server re-evaluates every step's `if`, lets any that
-          # evaluate true (always() included) keep running, sends
-          # SIGINT then SIGTERM to any still-running step process, and
-          # only force-kills the whole job after a 5-minute ceiling.
-          # A single curl call finishes in well under that. So this
-          # fires on every possible end of this job: normal
-          # budget-exhaustion exit, a manual cancel, ANY workflow-level
-          # cancellation -- the only thing that can stop it is disabling
-          # the workflow itself first (a disabled workflow can't be
-          # dispatched at all, which is exactly why shimdeploy.py's own
-          # disable-then-cancel sequence is the one genuine "stay down"
-          # path, and why that step already existed before this pass).
-          #
-          # Safe to fire UNCONDITIONALLY, every single time, with no
-          # exit-sentinel/clean-handoff check: `session`'s own
-          # concurrency group (cancel-in-progress: true, above) is what
-          # actually prevents duplication, the same way it already
-          # protects the warm-handoff path -- a self-dispatched run
-          # landing while a standby is mid-promotion into the SAME
-          # group is simply the newest arrival in that group, not a
-          # second live process outside it. No separate coordination
-          # needed here.
-          #
-          # Hard limit, stated plainly: this only helps for a
-          # GRACEFUL end (budget exhaustion, cancellation). A true
-          # crash -- OOM-killed by the host, a runner VM yanked away, a
-          # network partition -- gives this step no chance to run at
-          # all, same as it would give any other always() step no
-          # chance to run. Nothing polls for that case anymore now that
-          # watchdog.yml is gone; that gap is accepted for now per an
-          # explicit decision to drop the watchdog rather than keep
-          # iterating on it, not something this step silently covers.
           CYCLE=$(cat /tmp/shim_handoff_cycle_id 2>/dev/null || true)
           [ -n "$CYCLE" ] || CYCLE="hc-$(date +%s)"
-          CODE=$(curl -s -o /tmp/self_dispatch_resp -w "%{http_code}" -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d "{\"event_type\":\"restart-shim-runner\",\"client_payload\":{\"cycle_id\":\"${CYCLE}\",\"from_run_id\":\"${{ github.run_id }}\",\"reason\":\"${{ job.status }}\"}}")
-          [ "${CODE:-0}" -ge 200 ] 2>/dev/null && [ "${CODE:-0}" -lt 300 ] || cat /tmp/self_dispatch_resp 2>/dev/null || true
-          echo "Self-dispatched replacement session (cycle=${CYCLE}, HTTP ${CODE:-none})."
+          cat > /tmp/self_dispatch.py <<'PYEOF'
+          import os, json, time, urllib.request as U, datetime as D
+          repo = os.environ["GH_REPO"]; tok = os.environ["GH_TOKEN"]; me = os.environ["RUN_ID"]
+          cycle = os.environ.get("CYCLE", ""); status = os.environ.get("JOB_STATUS", "")
+          branch = os.environ.get("DEFAULT_BRANCH") or "main"
+          H = {"Authorization": "token " + tok, "Accept": "application/vnd.github.v3+json"}
+          ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+          def call(method, path, body=None):
+              try:
+                  req = U.Request("https://api.github.com/repos/%s/%s" % (repo, path), data=(json.dumps(body).encode() if body is not None else None), headers=H, method=method)
+                  with U.urlopen(req, timeout=20) as r:
+                      return r.status, r.read().decode()
+              except U.HTTPError as e:
+                  return e.code, e.read().decode()[:300]
+              except Exception as e:
+                  return 0, str(e)[:300]
+          def replacement(t0):
+              c, b = call("GET", "actions/runs?per_page=15")
+              try:
+                  runs = json.loads(b)["workflow_runs"]
+              except Exception:
+                  return False
+              for r in runs:
+                  if str(r["id"]) == me or r["status"] not in ACTIVE:
+                      continue
+                  try:
+                      ct = D.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                  except Exception:
+                      continue
+                  if ct < t0 - 5:
+                      continue
+                  c, jb = call("GET", "actions/runs/%s/jobs" % r["id"])
+                  try:
+                      jobs = json.loads(jb)["jobs"]
+                  except Exception:
+                      continue
+                  if not jobs or any(j["name"] == "session" and j.get("conclusion") != "skipped" for j in jobs):
+                      return True
+              return False
+          def wait_until(t0, end):
+              while time.time() < end:
+                  time.sleep(8)
+                  if replacement(t0):
+                      return True
+              return False
+          t0 = time.time()
+          code, body = call("POST", "dispatches", {"event_type": "restart-shim-runner", "client_payload": {"cycle_id": cycle, "from_run_id": me, "reason": status}})
+          via = "repository_dispatch"
+          ok = 200 <= code < 300 and wait_until(t0, t0 + 45)
+          if not ok:
+              print("self-dispatch via repository_dispatch not confirmed (HTTP %s) %s" % (code, body[:120]))
+              code, body = call("POST", "actions/workflows/runner.yml/dispatches", {"ref": branch})
+              via = "workflow_dispatch"
+              ok = 200 <= code < 300 and wait_until(t0, time.time() + 45)
+          print("self-dispatch %s via %s (HTTP %s, cycle=%s)" % ("confirmed" if ok else "NOT CONFIRMED", via, code, cycle))
+          open("/tmp/self_dispatch_status", "w").write(str(code))
+          PYEOF
+          GH_REPO="${{ github.repository }}" RUN_ID="${{ github.run_id }}" JOB_STATUS="${{ job.status }}" DEFAULT_BRANCH="${{ github.event.repository.default_branch }}" CYCLE="$CYCLE" timeout 160 python3 /tmp/self_dispatch.py || true
           if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
-            timeout 60 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "${CODE:-none}" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
+            timeout 30 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "$(cat /tmp/self_dispatch_status 2>/dev/null || echo none)" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
           fi
 
   standby:
-    if: github.event.action == 'dispatch-standby-shim-runner'
+    if: github.event.action == 'dispatch-standby-shim-runner' || (github.event_name == 'workflow_dispatch' && github.event.inputs.role == 'standby')
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id }}
-      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id }}
+      HANDOFF_CYCLE_ID: ${{ github.event.client_payload.cycle_id || github.event.inputs.cycle_id }}
+      DISPATCHED_BY: ${{ github.event.client_payload.from_run_id || github.event.inputs.from_run_id }}
       EVENT_ACTION: ${{ github.event.action }}
       SESSION_ROLE: warm-promoted
     concurrency:
       group: vps-shim-runner-standby
       cancel-in-progress: true
     steps:
+      - name: Record standby job start
+        run: date +%s > /tmp/standby_job_start_epoch
+
       - name: Write boot-progress helper script
         # v221: same helper/rationale as the session job's identical
         # step -- see that step's own comment. Duplicated rather than
@@ -640,7 +676,7 @@ jobs:
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
         run: |
-          WAIT_CEILING_SECONDS=1800
+          WAIT_CEILING_SECONDS="${STANDBY_WAIT_CEILING_SECONDS:-18000}"
           WAITED=0
           GO_FILE="/home/runner/shim/repo/vps-shim/state/go_standby.json"
           SPAWN_FROZEN_DONE=0
@@ -837,7 +873,14 @@ jobs:
         id: promote_start
         if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
         run: |
-          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          NOW_E=$(date +%s)
+          echo "start_epoch=${NOW_E}" >> "$GITHUB_OUTPUT"
+          JOB_S=$(cat /tmp/standby_job_start_epoch 2>/dev/null || echo 0)
+          BUDGET=${RUN_BUDGET_SECONDS}
+          if [ "${JOB_S:-0}" -gt 0 ] 2>/dev/null; then BUDGET=$((RUN_BUDGET_SECONDS - (NOW_E - JOB_S))); fi
+          [ "$BUDGET" -ge 900 ] || BUDGET=900
+          echo "budget=${BUDGET}" >> "$GITHUB_OUTPUT"
+          echo "promoted session budget ${BUDGET}s (standby job already ran $((NOW_E - ${JOB_S:-NOW_E}))s of its own timeout)"
 
       - name: Activate (promoted -- becomes the new active session)
         if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
@@ -863,6 +906,7 @@ jobs:
         if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
         env:
           START_EPOCH: ${{ steps.promote_start.outputs.start_epoch }}
+          RUN_BUDGET_SECONDS: ${{ steps.promote_start.outputs.budget }}
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
@@ -879,16 +923,18 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
+          CAPD=90; CAPS=240; PUSHT=""
+          if [ "${{ job.status }}" = "cancelled" ]; then CAPD=15; CAPS=60; PUSHT="timeout 40"; fi
           # v221: same existence guard as the session job's identical
           # step -- see that step's own comment.
           if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
-            timeout 90 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.promote_start.outputs.start_epoch }}" --field promoted="${{ steps.wait.outputs.promoted }}" --field claim_won="${{ steps.claim.outputs.won }}" >/dev/null 2>&1 || true
+            timeout $CAPD python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py end --job-status "${{ job.status }}" --start-epoch "${{ steps.promote_start.outputs.start_epoch }}" --field promoted="${{ steps.wait.outputs.promoted }}" --field claim_won="${{ steps.claim.outputs.won }}" >/dev/null 2>&1 || true
           fi
           if [ -f /home/runner/shim/repo/vps-shim/scripts/store_sync.py ]; then
-            SHIM_ROOT=/home/runner/shim timeout 240 python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
+            SHIM_ROOT=/home/runner/shim timeout $CAPS python3 /home/runner/shim/repo/vps-shim/scripts/store_sync.py save >> /home/runner/shim/repo/vps-shim/logs/store_sync.log 2>&1 || true
           fi
           if [ -f /home/runner/shim/repo/vps-shim/scripts/git_push.sh ]; then
-            bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+            $PUSHT bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
           else
             echo "repo was never checked out this run (likely cancelled before Setup environment) -- nothing to push, skipping"
           fi
@@ -921,19 +967,71 @@ jobs:
           # session's own identical step provides. Same grace-window
           # mechanics, same reasoning, same "crash is still not
           # covered" limit -- see that step's own longer comment.
+          cat > /tmp/self_dispatch.py <<'PYEOF'
+          import os, json, time, urllib.request as U, datetime as D
+          repo = os.environ["GH_REPO"]; tok = os.environ["GH_TOKEN"]; me = os.environ["RUN_ID"]
+          cycle = os.environ.get("CYCLE", ""); status = os.environ.get("JOB_STATUS", "")
+          branch = os.environ.get("DEFAULT_BRANCH") or "main"
+          H = {"Authorization": "token " + tok, "Accept": "application/vnd.github.v3+json"}
+          ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+          def call(method, path, body=None):
+              try:
+                  req = U.Request("https://api.github.com/repos/%s/%s" % (repo, path), data=(json.dumps(body).encode() if body is not None else None), headers=H, method=method)
+                  with U.urlopen(req, timeout=20) as r:
+                      return r.status, r.read().decode()
+              except U.HTTPError as e:
+                  return e.code, e.read().decode()[:300]
+              except Exception as e:
+                  return 0, str(e)[:300]
+          def replacement(t0):
+              c, b = call("GET", "actions/runs?per_page=15")
+              try:
+                  runs = json.loads(b)["workflow_runs"]
+              except Exception:
+                  return False
+              for r in runs:
+                  if str(r["id"]) == me or r["status"] not in ACTIVE:
+                      continue
+                  try:
+                      ct = D.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).timestamp()
+                  except Exception:
+                      continue
+                  if ct < t0 - 5:
+                      continue
+                  c, jb = call("GET", "actions/runs/%s/jobs" % r["id"])
+                  try:
+                      jobs = json.loads(jb)["jobs"]
+                  except Exception:
+                      continue
+                  if not jobs or any(j["name"] == "session" and j.get("conclusion") != "skipped" for j in jobs):
+                      return True
+              return False
+          def wait_until(t0, end):
+              while time.time() < end:
+                  time.sleep(8)
+                  if replacement(t0):
+                      return True
+              return False
+          t0 = time.time()
+          code, body = call("POST", "dispatches", {"event_type": "restart-shim-runner", "client_payload": {"cycle_id": cycle, "from_run_id": me, "reason": status}})
+          via = "repository_dispatch"
+          ok = 200 <= code < 300 and wait_until(t0, t0 + 45)
+          if not ok:
+              print("self-dispatch via repository_dispatch not confirmed (HTTP %s) %s" % (code, body[:120]))
+              code, body = call("POST", "actions/workflows/runner.yml/dispatches", {"ref": branch})
+              via = "workflow_dispatch"
+              ok = 200 <= code < 300 and wait_until(t0, time.time() + 45)
+          print("self-dispatch %s via %s (HTTP %s, cycle=%s)" % ("confirmed" if ok else "NOT CONFIRMED", via, code, cycle))
+          open("/tmp/self_dispatch_status", "w").write(str(code))
+          PYEOF
           if [ "${{ steps.wait.outputs.promoted }}" = "1" ] && [ "${{ steps.claim.outputs.won }}" = "1" ]; then
             CYCLE=$(cat /tmp/shim_handoff_cycle_id 2>/dev/null || true)
             [ -n "$CYCLE" ] || CYCLE="hc-$(date +%s)"
-            CODE=$(curl -s -o /tmp/self_dispatch_resp -w "%{http_code}" -X POST \
-              -H "Authorization: token ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-              -d "{\"event_type\":\"restart-shim-runner\",\"client_payload\":{\"cycle_id\":\"${CYCLE}\",\"from_run_id\":\"${{ github.run_id }}\",\"reason\":\"${{ job.status }}\"}}")
-            [ "${CODE:-0}" -ge 200 ] 2>/dev/null && [ "${CODE:-0}" -lt 300 ] || cat /tmp/self_dispatch_resp 2>/dev/null || true
-            echo "This standby was promoted and is now ending -- self-dispatched replacement session (cycle=${CYCLE}, HTTP ${CODE:-none})."
+            GH_REPO="${{ github.repository }}" RUN_ID="${{ github.run_id }}" JOB_STATUS="${{ job.status }}" DEFAULT_BRANCH="${{ github.event.repository.default_branch }}" CYCLE="$CYCLE" timeout 160 python3 /tmp/self_dispatch.py || true
             if [ -f /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py ]; then
-              timeout 60 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "${CODE:-none}" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
+              timeout 30 python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py dispatched --http-status "$(cat /tmp/self_dispatch_status 2>/dev/null || echo none)" --job-status "${{ job.status }}" --to-cycle "${CYCLE}" >/dev/null 2>&1 || true
             fi
+            echo "This standby was promoted and is now ending -- self-dispatch step finished (cycle=${CYCLE})."
           else
             echo "This standby was never promoted -- ordinary end, not self-dispatching anything."
           fi
